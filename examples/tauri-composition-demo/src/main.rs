@@ -5,9 +5,9 @@
 //! drive the window with real input (`SendInput`) and read what the page reports over IPC.
 //! Every result is a JSON line on stdout; the exit code is the number of failed checks.
 //!
-//! Usage: `tauri-composition-demo [scenario...]`, where a scenario is one of `cloak`, `input`,
-//! `dragout`, `rebuild`, `move`, `ime`, `closevisual`, `dragdrop`, `dup`, `bounds`, `jsclose`,
-//! `longcloak` and `hold`; without arguments it runs `ALL_SCENARIOS`, about three minutes. The
+//! Usage: `tauri-composition-demo [scenario...]`, where a scenario is one of `cloak`, `cloakhit`,
+//! `input`, `dragout`, `rebuild`, `move`, `ime`, `closevisual`, `dragdrop`, `dup`, `bounds`,
+//! `jsclose`, `longcloak` and `hold`; without arguments it runs `ALL_SCENARIOS`, about three minutes. The
 //! input scenarios move the real cursor and type, so leave mouse and keyboard alone meanwhile.
 //!
 //! - `DEMO_NO_INPUT=1` injects no input at all, cursor moves included.
@@ -46,8 +46,9 @@ const PALETTE: [(u8, u8, u8); 4] = [
   (0xc6, 0x28, 0x28),
 ];
 /// Input and IME run again after the rebuilds, the cloaks and a move, as in real use.
-const ALL_SCENARIOS: [&str; 13] = [
+const ALL_SCENARIOS: [&str; 14] = [
   "cloak",
+  "cloakhit",
   "input",
   "dragout",
   "rebuild",
@@ -430,6 +431,7 @@ fn run_scenarios(app: AppHandle, hwnd: isize, scenarios: Vec<String>) {
         "closevisual" => scenario_close_visual(&mut ctx),
         "dragdrop" => scenario_drag_drop(&mut ctx),
         "move" => scenario_move(&mut ctx),
+        "cloakhit" => scenario_cloak_hit_test(&mut ctx),
         "hold" => thread::sleep(Duration::from_millis(
           std::env::var("DEMO_HOLD_MS")
             .ok()
@@ -1040,6 +1042,49 @@ fn rebuild_once(ctx: &mut Ctx, iteration: u32) -> bool {
 /// Baseline mode: skip the registration so wry builds ordinary windowed webviews.
 fn windowed() -> bool {
   std::env::var_os("DEMO_WINDOWED").is_some()
+}
+
+/// WebView2Feedback #5668 saw a WebView2 window stay uncloaked and eat desktop clicks. While the
+/// menu is cloaked, a click anywhere in its rectangle (a 7 × 5 grid of hit-test queries, no real
+/// clicks) must go to whatever is behind it. Windows of this process and of its WebView2
+/// processes that stay visible and uncloaked are logged.
+fn scenario_cloak_hit_test(ctx: &mut Ctx) {
+  let width = ctx.ready["width"].as_f64().unwrap_or(960.0);
+  let height = ctx.ready["height"].as_f64().unwrap_or(640.0);
+  let grid: Vec<(i32, i32)> = (1..=7)
+    .flat_map(|i| (1..=5).map(move |j| (width * f64::from(i) / 8.0, height * f64::from(j) / 6.0)))
+    .map(|(x, y)| ctx.css_to_screen(x, y))
+    .collect();
+  let hits = |grid: &[(i32, i32)]| -> Vec<win::WindowAt> {
+    grid.iter().map(|&point| win::window_at(point)).collect()
+  };
+  let host = ctx.hwnd;
+  let uncloaked = hits(&grid);
+  let windows_uncloaked = win::own_top_level_windows();
+  set_cloak(ctx, true);
+  thread::sleep(Duration::from_millis(300));
+  let cloaked = hits(&grid);
+  let windows_cloaked = win::own_top_level_windows();
+  set_cloak(ctx, false);
+  let ours = |w: &win::WindowAt| w.root == host || w.exe.eq_ignore_ascii_case("msedgewebview2.exe");
+  let menu_hits = uncloaked.iter().filter(|w| w.root == host).count();
+  let swallowed: Vec<&win::WindowAt> = cloaked.iter().filter(|w| ours(w)).collect();
+  ctx.check(
+    "cloakhit: while cloaked, clicks anywhere in the menu area go to the window behind",
+    menu_hits == grid.len() && swallowed.is_empty(),
+    json!({ "points": grid.len(), "menu_hits_uncloaked": menu_hits,
+            "swallowed_while_cloaked": swallowed, "behind": cloaked.first() }),
+  );
+  let exposed: Vec<&win::TopLevel> = windows_cloaked
+    .iter()
+    .filter(|w| w.cloaked == 0 && w.class != "Tao Thread Event Target")
+    .collect();
+  log(
+    "info",
+    json!({ "name": "visible top-level windows of this process and its WebView2 processes",
+            "host": host, "uncloaked_menu": windows_uncloaked, "cloaked_menu": windows_cloaked,
+            "not_cloaked_with_the_menu": exposed }),
+  );
 }
 
 /// The open sequence of PinPaper ARCHITECTURE 4.5.1: move the window while cloaked, then uncloak.

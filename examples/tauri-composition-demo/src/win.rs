@@ -42,13 +42,14 @@ use windows::{
         VIRTUAL_KEY, VK_ESCAPE,
       },
       WindowsAndMessaging::{
-        EnumChildWindows, GA_ROOT, GUITHREADINFO, GWL_EXSTYLE, GWL_STYLE, GetAncestor,
-        GetClassNameW, GetCursorPos, GetForegroundWindow, GetGUIThreadInfo, GetPropW,
-        GetSystemMetrics, GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId, IsWindow,
-        SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
-        SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SetWindowLongPtrW,
-        SetWindowPos, WS_CAPTION, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_MAXIMIZEBOX,
-        WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU, WS_THICKFRAME, WindowFromPoint,
+        EnumChildWindows, EnumWindows, GA_ROOT, GUITHREADINFO, GW_OWNER, GWL_EXSTYLE, GWL_STYLE,
+        GetAncestor, GetClassNameW, GetCursorPos, GetForegroundWindow, GetGUIThreadInfo, GetPropW,
+        GetSystemMetrics, GetWindow, GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId,
+        IsWindow, IsWindowVisible, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+        SM_YVIRTUALSCREEN, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+        SetWindowLongPtrW, SetWindowPos, WS_CAPTION, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
+        WS_EX_TOPMOST, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU, WS_THICKFRAME,
+        WindowFromPoint,
       },
     },
   },
@@ -539,6 +540,79 @@ pub fn element_at((x, y): (i32, i32)) -> Option<PointElement> {
       rect: [rect.left, rect.top, rect.right, rect.bottom],
     })
   }
+}
+
+#[derive(Debug, Serialize)]
+pub struct WindowAt {
+  pub root: isize,
+  pub class: String,
+  pub exe: String,
+}
+
+/// The top-level window a click at this screen point would go to (a query, not a click).
+pub fn window_at(point: (i32, i32)) -> WindowAt {
+  let root = unsafe {
+    GetAncestor(
+      WindowFromPoint(POINT {
+        x: point.0,
+        y: point.1,
+      }),
+      GA_ROOT,
+    )
+  };
+  WindowAt {
+    root: root.0 as isize,
+    class: class_name(root),
+    exe: exe_of_window(root),
+  }
+}
+
+#[derive(Debug, Serialize)]
+pub struct TopLevel {
+  pub hwnd: isize,
+  pub owner: isize,
+  pub class: String,
+  pub exe: String,
+  pub rect: [i32; 4],
+  pub cloaked: u32,
+  pub ex_style: String,
+}
+
+/// Visible top-level windows owned by this process or the WebView2 processes it spawned.
+pub fn own_top_level_windows() -> Vec<TopLevel> {
+  unsafe extern "system" fn collect(hwnd: HWND, lparam: LPARAM) -> BOOL {
+    let all = unsafe { &mut *(lparam.0 as *mut Vec<HWND>) };
+    if unsafe { IsWindowVisible(hwnd) }.as_bool() {
+      all.push(hwnd);
+    }
+    BOOL::from(true)
+  }
+  let mut pids = descendants(unsafe { GetCurrentProcessId() }, "msedgewebview2.exe");
+  pids.push(unsafe { GetCurrentProcessId() });
+  let mut all: Vec<HWND> = Vec::new();
+  let _ = unsafe { EnumWindows(Some(collect), LPARAM(&mut all as *mut Vec<HWND> as isize)) };
+  all
+    .into_iter()
+    .filter(|&hwnd| {
+      let mut pid = 0u32;
+      unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
+      pids.contains(&pid)
+    })
+    .map(|hwnd| {
+      let mut rect = RECT::default();
+      let _ = unsafe { GetWindowRect(hwnd, &mut rect) };
+      TopLevel {
+        hwnd: hwnd.0 as isize,
+        owner: unsafe { GetWindow(hwnd, GW_OWNER) }.map_or(0, |owner| owner.0 as isize),
+        class: class_name(hwnd),
+        exe: exe_of_window(hwnd),
+        rect: [rect.left, rect.top, rect.right, rect.bottom],
+        cloaked: cloaked(hwnd),
+        ex_style: format!("{:#010x}", unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) }
+          as u32),
+      }
+    })
+    .collect()
 }
 
 /// Class names of `parent`'s descendant windows that carry an OLE drop target

@@ -428,5 +428,6 @@
 - **待解问题 1**：关闭 webview 后提交宿主设备，旧页面的最后一帧会从屏幕上消失（`closevisual` 场景）。`rebuild` 场景重建 60 次，其中 30 次让新 webview 复用上一个 webview 的 visual，另外 30 次换新 visual，每次都正常显示。
 - **待解问题 2**：visual hosting 下宿主窗口下有一个 `Chrome_WidgetWin_0` 子窗口，属于宿主进程；点击后它持有键盘焦点（`GetGUIThreadInfo`）。
 - **待解问题 4**：宿主窗口 cloak 10 秒期间，页面的 `requestAnimationFrame` 照常运行（约每秒 161 帧），`document.visibilityState` 一直是 `visible`；解除 cloak 后约 6 ms 画面上屏，约 12 ms 出下一帧（`longcloak` 场景）。
+- **待解问题 6 与 #5668**：宿主 cloak 后，菜单区域内 7×5 个点的 `WindowFromPoint` 全部落到背后的窗口，移窗前后都一样，被 cloak 的宿主不参与命中测试（`cloakhit` 场景）。但 WebView2 浏览器进程里有一个顶层窗口不随宿主 cloak：类名 `Chrome_WidgetWin_1`，没有所有者，扩展样式 `0x08280080`（分层、不激活、无重定向位图、工具窗口），矩形和宿主重合并跟着宿主移动。它在 156 上完全透明，点击也能穿过，所以没有吞掉点击；这就是 #5668 说的那类窗口，升级运行时后要复查。
 - **待解问题 12**：按住左键拖出窗口 5 次后，悬停、点击、键盘仍然到达页面，没有复现 #5712（`dragout` 场景）。从已选中的文字上开始拖时，页面发起 HTML 拖放，OLE 的 `CLIPBRDWNDCLASS` 窗口接管捕获，松开不再以 `mouseup` 送到页面；这是浏览器的正常行为，拖放结束后输入照常。
 - **2b（候选窗位置）**：组字起点正下方的 UI Automation 元素属于 `TextInputHost.exe`，名字就是第一候选，与页面算出的组字起点偏差在 10 px 以内（`ime` 场景）。祖先 visual 有偏移时的情况没有测。
