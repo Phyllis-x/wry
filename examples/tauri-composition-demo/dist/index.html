@@ -1,0 +1,170 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <title>composition demo</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        overflow: hidden;
+        font: 16px 'Segoe UI', 'Microsoft YaHei UI', sans-serif;
+        color: #fff;
+      }
+      body {
+        background: var(--bg, #000);
+      }
+      #target {
+        position: absolute;
+        left: 40px;
+        top: 40px;
+        width: 240px;
+        height: 120px;
+        background: #424242;
+        display: grid;
+        place-items: center;
+        /* A drag that starts here stays a plain mouse drag, never a text drag-and-drop. */
+        user-select: none;
+      }
+      #target:hover {
+        background: #ffb300;
+        color: #000;
+      }
+      #text {
+        position: absolute;
+        left: 40px;
+        top: 220px;
+        width: 480px;
+        height: 96px;
+        padding: 8px;
+        font-size: 24px;
+        line-height: 32px;
+        box-sizing: border-box;
+      }
+      #spinner {
+        position: absolute;
+        right: 60px;
+        top: 50px;
+        width: 64px;
+        height: 64px;
+        background: #fff;
+      }
+      #status {
+        position: absolute;
+        left: 40px;
+        bottom: 24px;
+        font-size: 14px;
+        opacity: 0.85;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="target">hover / click / wheel</div>
+    <textarea id="text" spellcheck="false"></textarea>
+    <div id="spinner"></div>
+    <div id="status"></div>
+    <script>
+      const gen = window.__GEN ?? 0;
+      const palette = ['#2e7d32', '#1565c0', '#6a1b9a', '#c62828'];
+      const bg = palette[gen % palette.length];
+      document.documentElement.style.setProperty('--bg', bg);
+
+      const invoke = (cmd, args) => window.__TAURI_INTERNALS__.invoke(cmd, args);
+      const report = (kind, data = {}) => invoke('report', { kind, generation: gen, data }).catch(() => {});
+
+      const target = document.getElementById('target');
+      const text = document.getElementById('text');
+      const spinner = document.getElementById('spinner');
+      const status = document.getElementById('status');
+      const name = (el) => (el && (el.id || el.tagName)) || null;
+      const rectOf = (el) => {
+        const r = el.getBoundingClientRect();
+        return { left: r.left, top: r.top, right: r.right, bottom: r.bottom };
+      };
+
+      let frames = 0;
+      const tick = (t) => {
+        frames++;
+        spinner.style.transform = `rotate(${(t / 8) % 360}deg)`;
+        if (frames % 30 === 0) status.textContent = `gen ${gen} · frames ${frames} · ${document.visibilityState}`;
+        requestAnimationFrame(tick);
+      };
+      requestAnimationFrame(tick);
+
+      window.__probe = (id) =>
+        requestAnimationFrame(() =>
+          report('probe', { id, frames, visibility: document.visibilityState, hasFocus: document.hasFocus() }),
+        );
+      window.__hoverState = () => report('hover-state', { hover: target.matches(':hover') });
+      window.__textState = () =>
+        report('text-state', { value: text.value, focused: document.activeElement === text, rect: rectOf(text) });
+      window.__clearText = () => {
+        text.value = '';
+        report('text-cleared');
+      };
+
+      document.addEventListener('visibilitychange', () => report('visibility', { state: document.visibilityState }));
+      window.addEventListener('focus', () => report('window-focus'));
+      window.addEventListener('blur', () => report('window-blur'));
+
+      target.addEventListener('pointerenter', (e) => report('pointerenter', { x: e.clientX, y: e.clientY, pointerType: e.pointerType }));
+      target.addEventListener('pointerleave', (e) => report('pointerleave', { pointerType: e.pointerType }));
+      document.documentElement.addEventListener('mouseleave', () => report('document-mouseleave'));
+      let moved = false;
+      document.addEventListener('mousemove', (e) => {
+        if (!moved) report('mousemove', { x: e.clientX, y: e.clientY });
+        moved = true;
+      });
+      for (const type of ['mousedown', 'mouseup', 'click', 'auxclick']) {
+        document.addEventListener(type, (e) =>
+          report(type, { x: e.clientX, y: e.clientY, button: e.button, buttons: e.buttons, target: name(e.target) }),
+        );
+      }
+      for (const type of ['dragstart', 'dragend']) {
+        document.addEventListener(type, (e) => report(type, { target: name(e.target) }));
+      }
+      document.addEventListener(
+        'wheel',
+        (e) => report('wheel', { deltaX: e.deltaX, deltaY: e.deltaY, deltaMode: e.deltaMode, target: name(e.target) }),
+        { passive: true },
+      );
+
+      text.addEventListener('focus', () => report('text-focus'));
+      text.addEventListener('keydown', (e) => report('keydown', { key: e.key, code: e.code, isComposing: e.isComposing }));
+      // Where the composition starts, in CSS pixels: the IME places its candidate window there.
+      const measure = document.createElement('canvas').getContext('2d');
+      const caret = () => {
+        const style = getComputedStyle(text);
+        measure.font = style.font;
+        const before = text.value.slice(0, text.selectionStart).split('\n').pop();
+        const r = text.getBoundingClientRect();
+        return {
+          x: r.left + parseFloat(style.paddingLeft) + measure.measureText(before).width,
+          lineBottom: r.top + parseFloat(style.paddingTop) + parseFloat(style.lineHeight),
+        };
+      };
+      for (const type of ['compositionstart', 'compositionupdate', 'compositionend']) {
+        text.addEventListener(type, (e) =>
+          report(type, { data: e.data, value: text.value, caret: type === 'compositionstart' ? caret() : null }),
+        );
+      }
+      text.addEventListener('input', (e) =>
+        report('input', { value: text.value, data: e.data, inputType: e.inputType, isComposing: e.isComposing }),
+      );
+
+      addEventListener('load', () =>
+        report('ready', {
+          href: location.href,
+          dpr: devicePixelRatio,
+          width: innerWidth,
+          height: innerHeight,
+          target: rectOf(target),
+          text: rectOf(text),
+          bg,
+          userAgent: navigator.userAgent,
+        }),
+      );
+    </script>
+  </body>
+</html>
