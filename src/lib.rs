@@ -1906,6 +1906,10 @@ pub trait WebViewBuilderExtWindows {
   /// webview can be built on it afterwards. A window hosts at most one
   /// composition webview at a time; building a second one fails.
   ///
+  /// [`WebViewBuilder::with_drag_drop_handler`] has no effect in this mode: OLE
+  /// drops never reach the webview on their own, so the host handles them
+  /// itself (and may forward them through `ICoreWebView2CompositionController3`).
+  ///
   /// Combine with [`WebViewBuilder::with_transparent`] for a webview that
   /// composites over content drawn on sibling visuals below it.
   ///

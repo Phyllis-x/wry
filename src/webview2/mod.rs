@@ -204,7 +204,10 @@ impl InnerWebView {
       is_composition,
     )?;
 
-    let drag_drop_controller = drop_handler.map(|handler| {
+    // OLE drops never reach a composition webview on their own; a host that
+    // wants them forwards them (`ICoreWebView2CompositionController3`). Drop
+    // targets on the host's child windows would only take them from the host.
+    let drag_drop_controller = drop_handler.filter(|_| !is_composition).map(|handler| {
       // Disable file drops, so our handler can capture it
       unsafe {
         let _ = controller
@@ -667,11 +670,7 @@ impl InnerWebView {
     }
 
     // Subclass parent for resizing and focus
-    if is_composition {
-      // The composition host subclass owns resize/focus AND forwards
-      // mouse/pointer input + cursor to the visual-hosted webview.
-      unsafe { composition::attach_host_subclass(parent, controller)? };
-    } else if !is_child {
+    if !is_child && !is_composition {
       unsafe { Self::attach_parent_subclass(parent, controller) };
     }
 
@@ -691,6 +690,14 @@ impl InnerWebView {
           Self::load_extensions(&webview, &extension_path)?;
         }
       }
+    }
+
+    // The composition host subclass owns resize/focus AND forwards
+    // mouse/pointer input + cursor to the visual-hosted webview. Attached last:
+    // if a step above failed with the subclass in place, the window would keep
+    // refusing composition webviews without hosting one.
+    if is_composition {
+      unsafe { composition::attach_host_subclass(parent, controller)? };
     }
 
     Ok(webview)

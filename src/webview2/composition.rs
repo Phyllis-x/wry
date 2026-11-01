@@ -20,6 +20,7 @@ use std::{
   cell::{Cell, RefCell},
   collections::HashMap,
   panic::{AssertUnwindSafe, catch_unwind},
+  rc::Rc,
   sync::mpsc,
 };
 
@@ -139,9 +140,11 @@ pub(crate) fn ensure_host_available(hwnd: HWND) -> Result<()> {
   Ok(())
 }
 
-/// Per-host state carried through the subclass `dwrefdata`. Boxed at attach,
-/// freed on `WM_DESTROY`/[`COMPOSITION_DESTROY_MESSAGE`] after the subclass is
-/// removed, the same teardown order as the windowed parent subclass.
+/// Per-host state carried through the subclass `dwrefdata` as a strong `Rc`
+/// reference owned by the subclass. `WM_DESTROY`/[`COMPOSITION_DESTROY_MESSAGE`]
+/// remove the subclass, then release that reference; every message handler
+/// holds one of its own while it runs, so a nested teardown cannot free the
+/// state under it.
 struct CompositionHost {
   controller: ICoreWebView2Controller,
   comp_controller: ICoreWebView2CompositionController,
@@ -155,7 +158,7 @@ struct CompositionHost {
   /// Whether a `TrackMouseEvent(TME_LEAVE)` request is outstanding, so
   /// `WM_MOUSELEAVE` is delivered exactly once per hover session.
   mouse_tracking: Cell<bool>,
-  cursor_changed_token: i64,
+  cursor_changed_token: Cell<i64>,
 }
 
 /// Creates a WebView2 composition controller parented (for input/ownership
@@ -178,12 +181,16 @@ pub(crate) fn create_composition_controller(
 
   let handler = CreateCoreWebView2CompositionControllerCompletedHandler::create(Box::new(
     move |error_code, controller| {
-      let result = (|| {
-        error_code?;
-        controller.ok_or_else(|| windows::core::Error::from(E_POINTER).into())
-      })();
-      tx.send(result)
-        .map_err(|_| windows::core::Error::from(E_UNEXPECTED))
+      // Called from a COM callback; a panic must not unwind into WebView2.
+      catch_unwind(AssertUnwindSafe(move || {
+        let result = (|| {
+          error_code?;
+          controller.ok_or_else(|| windows::core::Error::from(E_POINTER).into())
+        })();
+        tx.send(result)
+          .map_err(|_| windows::core::Error::from(E_UNEXPECTED))
+      }))
+      .unwrap_or_else(|_| Err(windows::core::Error::from(E_FAIL)))
     },
   ));
 
@@ -261,30 +268,27 @@ pub(crate) unsafe fn attach_host_subclass(
 
     let default_cursor = LoadCursorW(None, IDC_ARROW).unwrap_or_default();
 
-    let host = Box::new(CompositionHost {
+    let host = Rc::new(CompositionHost {
       controller: controller.clone(),
       comp_controller: comp_controller.clone(),
       env3,
       cursor: Cell::new(default_cursor),
       mouse_tracking: Cell::new(false),
-      cursor_changed_token: 0,
+      cursor_changed_token: Cell::new(0),
     });
-    let host_ptr = Box::into_raw(host);
 
     // The webview pushes cursor changes (I-beam over text, pointer over links…);
     // remember the cursor for WM_SETCURSOR and apply it immediately, since the
     // mouse is over the webview when the change fires.
+    let weak_host = Rc::downgrade(&host);
     let mut token = 0i64;
-    let register = comp_controller.add_CursorChanged(
+    comp_controller.add_CursorChanged(
       &CursorChangedEventHandler::create(Box::new(move |sender, _args| {
         // Called from a COM event; a panic must not unwind into WebView2.
         catch_unwind(AssertUnwindSafe(|| {
-          if let Some(sender) = sender {
+          if let (Some(host), Some(sender)) = (weak_host.upgrade(), sender) {
             if let Some(cursor) = resolve_cursor(&sender) {
-              // SAFETY: the host box outlives the registration — the destroy
-              // path removes this handler before freeing the box, on the same
-              // thread.
-              (*host_ptr).cursor.set(cursor);
+              host.cursor.set(cursor);
               let _ = SetCursor(Some(cursor));
             }
           }
@@ -292,22 +296,20 @@ pub(crate) unsafe fn attach_host_subclass(
         .map_err(|_| windows::core::Error::from(E_FAIL))
       })),
       &mut token,
-    );
-    if let Err(e) = register {
-      drop(Box::from_raw(host_ptr));
-      return Err(e.into());
-    }
-    (*host_ptr).cursor_changed_token = token;
+    )?;
+    host.cursor_changed_token.set(token);
 
+    // The subclass owns one strong reference, released on the destroy messages.
+    let refdata = Rc::into_raw(host);
     let result = SetWindowSubclass(
       parent,
       Some(host_subclass_proc),
       COMPOSITION_SUBCLASS_ID as usize,
-      host_ptr as usize,
+      refdata as usize,
     );
     if !result.as_bool() {
-      let _ = comp_controller.remove_CursorChanged(token);
-      drop(Box::from_raw(host_ptr));
+      let host = Rc::from_raw(refdata);
+      let _ = host.comp_controller.remove_CursorChanged(token);
       return Err(Error::WebView2Error(webview2_com::Error::WindowsError(
         windows::core::Error::from(E_UNEXPECTED),
       )));
@@ -361,38 +363,48 @@ unsafe extern "system" fn host_subclass_proc(
   // A panic must not unwind into the window manager; fall back to the next
   // window procedure instead.
   catch_unwind(AssertUnwindSafe(|| unsafe {
-    handle_host_message(hwnd, msg, wparam, lparam, dwrefdata as *mut CompositionHost)
+    handle_host_message(
+      hwnd,
+      msg,
+      wparam,
+      lparam,
+      dwrefdata as *const CompositionHost,
+    )
   }))
   .unwrap_or_else(|_| unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) })
 }
 
-/// `host_ptr` is the `CompositionHost` boxed by [`attach_host_subclass`]; it
-/// stays valid until this function frees it on the destroy messages.
+/// `refdata` is the subclass's strong reference from [`attach_host_subclass`];
+/// it stays valid until this function releases it on the destroy messages.
 unsafe fn handle_host_message(
   hwnd: HWND,
   msg: u32,
   wparam: WPARAM,
   lparam: LPARAM,
-  host_ptr: *mut CompositionHost,
+  refdata: *const CompositionHost,
 ) -> LRESULT {
   unsafe {
+    // Our own reference for the whole message: forwarding re-enters the window
+    // procedure (`MoveFocus` sends focus messages synchronously), and a nested
+    // message may tear the webview down and release the subclass's reference.
+    Rc::increment_strong_count(refdata);
+    let host = Rc::from_raw(refdata);
+
     if msg == WM_DESTROY || msg == COMPOSITION_DESTROY_MESSAGE {
-      // Unsubclass before freeing the host state, so nothing re-entered while
-      // the controller tears down can reach it.
+      // Unsubclass before releasing the subclass's reference, so no later
+      // message can reach it.
       let _ = RemoveWindowSubclass(
         hwnd,
         Some(host_subclass_proc),
         COMPOSITION_SUBCLASS_ID as usize,
       );
-      let host = Box::from_raw(host_ptr);
       let _ = host
         .comp_controller
-        .remove_CursorChanged(host.cursor_changed_token);
-      drop(host);
+        .remove_CursorChanged(host.cursor_changed_token.get());
+      Rc::decrement_strong_count(refdata);
       return DefSubclassProc(hwnd, msg, wparam, lparam);
     }
 
-    let host = &*host_ptr;
     match msg {
       WM_SIZE if wparam.0 != SIZE_MINIMIZED as usize => {
         let mut client_rect = RECT::default();
@@ -427,7 +439,7 @@ unsafe fn handle_host_message(
       | WM_LBUTTONUP | WM_LBUTTONDBLCLK | WM_RBUTTONDOWN | WM_RBUTTONUP | WM_RBUTTONDBLCLK
       | WM_MBUTTONDOWN | WM_MBUTTONUP | WM_MBUTTONDBLCLK | WM_XBUTTONDOWN | WM_XBUTTONUP
       | WM_XBUTTONDBLCLK => {
-        forward_mouse_message(host, hwnd, msg, wparam, lparam);
+        forward_mouse_message(&host, hwnd, msg, wparam, lparam);
         // Deliberately fall through to DefSubclassProc: the host's own window
         // proc still sees the message, so host-side window machinery (its event
         // stream, drag/resize bookkeeping) keeps working. The webview and the
@@ -436,7 +448,7 @@ unsafe fn handle_host_message(
       }
 
       WM_POINTERDOWN | WM_POINTERUPDATE | WM_POINTERUP => {
-        forward_pointer_message(host, hwnd, msg, wparam);
+        forward_pointer_message(&host, hwnd, msg, wparam);
       }
 
       _ => (),
@@ -601,7 +613,7 @@ fn forward_pointer_message(host: &CompositionHost, hwnd: HWND, msg: u32, wparam:
 
 /// Copies the shared `POINTER_INFO` fields into a `ICoreWebView2PointerInfo`,
 /// translating the screen-based pixel locations into host client coordinates.
-unsafe fn fill_common_pointer_info(
+fn fill_common_pointer_info(
   info: &ICoreWebView2PointerInfo,
   hwnd: HWND,
   src: &POINTER_INFO,
