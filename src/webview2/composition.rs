@@ -11,10 +11,15 @@
 //! must hand-deliver mouse/pointer events and cursor updates. Keyboard input
 //! needs no forwarding — once `MoveFocus` is called, WebView2's hidden input
 //! window takes Win32 focus and receives keys and IME natively.
+//!
+//! The host window belongs to the caller: dropping the webview detaches the
+//! host subclass but never destroys the window, so another webview can be
+//! built on it later.
 
 use std::{
   cell::{Cell, RefCell},
   collections::HashMap,
+  panic::{AssertUnwindSafe, catch_unwind},
   sync::mpsc,
 };
 
@@ -23,29 +28,35 @@ use webview2_com::{
   Microsoft::Web::WebView2::Win32::*,
 };
 use windows::{
-  core::{IUnknown, Interface, HSTRING, PCWSTR},
   Win32::{
-    Foundation::{E_POINTER, E_UNEXPECTED, HWND, LPARAM, LRESULT, RECT, WPARAM},
+    Foundation::{
+      E_FAIL, E_POINTER, E_UNEXPECTED, ERROR_ALREADY_EXISTS, HWND, LPARAM, LRESULT, POINT, RECT,
+      WPARAM,
+    },
     Graphics::Gdi::ScreenToClient,
     UI::{
       Input::{
         KeyboardAndMouse::{
-          ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
+          ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
         },
-        Pointer::{GetPointerPenInfo, GetPointerTouchInfo, GetPointerType, POINTER_INFO},
+        Pointer::{
+          GetPointerPenInfo, GetPointerTouchInfo, GetPointerType, POINTER_INFO, POINTER_PEN_INFO,
+          POINTER_TOUCH_INFO,
+        },
       },
-      Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass},
+      Shell::{DefSubclassProc, GetWindowSubclass, RemoveWindowSubclass, SetWindowSubclass},
       WindowsAndMessaging::{
-        GetClientRect, LoadCursorW, SendMessageW, SetCursor, HCURSOR, HTCLIENT, IDC_ARROW,
-        POINTER_INPUT_TYPE, PT_PEN, PT_TOUCH, SIZE_MINIMIZED, WM_DESTROY, WM_ENTERSIZEMOVE,
-        WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDBLCLK, WM_MBUTTONDOWN,
-        WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_MOVE, WM_MOVING,
-        WM_POINTERDOWN, WM_POINTERUP, WM_POINTERUPDATE, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN,
-        WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS, WM_SIZE, WM_USER, WM_XBUTTONDBLCLK,
-        WM_XBUTTONDOWN, WM_XBUTTONUP,
+        GetClientRect, HCURSOR, HTCLIENT, IDC_ARROW, LoadCursorW, POINTER_INPUT_TYPE, PT_PEN,
+        PT_TOUCH, SIZE_MINIMIZED, SendMessageW, SetCursor, WM_DESTROY, WM_LBUTTONDBLCLK,
+        WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDBLCLK, WM_MBUTTONDOWN, WM_MBUTTONUP,
+        WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_MOVE, WM_MOVING, WM_POINTERDOWN,
+        WM_POINTERUP, WM_POINTERUPDATE, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN, WM_RBUTTONUP,
+        WM_SETCURSOR, WM_SETFOCUS, WM_SIZE, WM_USER, WM_XBUTTONDBLCLK, WM_XBUTTONDOWN,
+        WM_XBUTTONUP,
       },
     },
   },
+  core::{HSTRING, IUnknown, Interface, PCWSTR},
 };
 
 use crate::{Error, Result};
@@ -86,9 +97,13 @@ thread_local! {
 /// created on that window; registering again replaces any pending entry for
 /// the same HWND. A builder-supplied target always takes precedence.
 ///
-/// Must be called from the UI thread, before the webview is built. An entry
-/// that is never consumed holds one COM reference to the visual until the
-/// thread exits.
+/// Must be called from the UI thread, before the webview is built; an entry
+/// registered on another thread is never seen, and the webview silently falls
+/// back to windowed hosting. Register again before each new webview on the
+/// same window. WebView2 connects its visual tree to `visual` while the webview
+/// is built, so commit the DirectComposition device that owns `visual` after
+/// the webview is created. An entry that is never consumed holds one COM
+/// reference to the visual until the thread exits.
 pub fn register_composition_visual_target(hwnd: isize, visual: IUnknown) {
   PENDING_VISUAL_TARGETS.with(|targets| {
     targets.borrow_mut().insert(hwnd, visual);
@@ -100,9 +115,33 @@ pub(crate) fn take_registered_visual_target(hwnd: isize) -> Option<IUnknown> {
   PENDING_VISUAL_TARGETS.with(|targets| targets.borrow_mut().remove(&hwnd))
 }
 
+/// Fails if `hwnd` already hosts a composition webview. The host subclass and
+/// its state exist once per window, so a second composition webview on the
+/// same window would silently take over the first one's input forwarding.
+pub(crate) fn ensure_host_available(hwnd: HWND) -> Result<()> {
+  let attached = unsafe {
+    GetWindowSubclass(
+      hwnd,
+      Some(host_subclass_proc),
+      COMPOSITION_SUBCLASS_ID as usize,
+      None,
+    )
+  };
+  if attached.as_bool() {
+    return Err(
+      windows::core::Error::new(
+        ERROR_ALREADY_EXISTS.to_hresult(),
+        "the window already hosts a composition webview",
+      )
+      .into(),
+    );
+  }
+  Ok(())
+}
+
 /// Per-host state carried through the subclass `dwrefdata`. Boxed at attach,
-/// freed on `WM_DESTROY`/[`COMPOSITION_DESTROY_MESSAGE`] with the same
-/// null-out-refdata double-free guard the parent subclass uses.
+/// freed on `WM_DESTROY`/[`COMPOSITION_DESTROY_MESSAGE`] after the subclass is
+/// removed, the same teardown order as the windowed parent subclass.
 struct CompositionHost {
   controller: ICoreWebView2Controller,
   comp_controller: ICoreWebView2CompositionController,
@@ -127,7 +166,7 @@ struct CompositionHost {
 /// carries incognito + profile name + default background color; otherwise the
 /// plain environment-3 creation is used (composition hosting does not exist
 /// below environment 3) and the background color is applied post-creation.
-pub fn create_composition_controller(
+pub(crate) fn create_composition_controller(
   hwnd: HWND,
   env: &ICoreWebView2Environment,
   incognito: bool,
@@ -174,17 +213,14 @@ pub fn create_composition_controller(
 
       env10.CreateCoreWebView2CompositionControllerWithOptions(hwnd, &controller_opts, &handler)?;
     } else {
-      let env3 = env
-        .cast::<ICoreWebView2Environment3>()
-        .map_err(windows::core::Error::from)?;
+      let env3 = env.cast::<ICoreWebView2Environment3>()?;
       env3.CreateCoreWebView2CompositionController(hwnd, &handler)?;
     }
   }
 
   let comp_controller: ICoreWebView2CompositionController = webview2_com::wait_with_pump(rx)??;
 
-  let controller: ICoreWebView2Controller =
-    comp_controller.cast().map_err(windows::core::Error::from)?;
+  let controller: ICoreWebView2Controller = comp_controller.cast()?;
 
   unsafe {
     comp_controller.SetRootVisualTarget(visual)?;
@@ -205,75 +241,80 @@ pub fn create_composition_controller(
 /// client area, (b) forward mouse and touch/pen input to the composition
 /// controller, and (c) apply the webview's cursor. The counterpart of
 /// `InnerWebView::attach_parent_subclass` for composition mode.
-pub unsafe fn attach_host_subclass(
+pub(crate) unsafe fn attach_host_subclass(
   parent: HWND,
   controller: &ICoreWebView2Controller,
 ) -> Result<()> {
-  let comp_controller: ICoreWebView2CompositionController =
-    controller.cast().map_err(windows::core::Error::from)?;
+  unsafe {
+    let comp_controller: ICoreWebView2CompositionController = controller.cast()?;
 
-  // Environment 3 is available by construction (the composition controller
-  // could not have been created without it); fetch it back through the
-  // webview's environment for pointer-info creation. A failure here only
-  // disables touch/pen forwarding.
-  let env3: Option<ICoreWebView2Environment3> = controller
-    .CoreWebView2()
-    .ok()
-    .and_then(|webview| webview.cast::<ICoreWebView2_2>().ok())
-    .and_then(|webview2| webview2.Environment().ok())
-    .and_then(|env| env.cast::<ICoreWebView2Environment3>().ok());
+    // Environment 3 is available by construction (the composition controller
+    // could not have been created without it); fetch it back through the
+    // webview's environment for pointer-info creation. A failure here only
+    // disables touch/pen forwarding.
+    let env3: Option<ICoreWebView2Environment3> = controller
+      .CoreWebView2()
+      .ok()
+      .and_then(|webview| webview.cast::<ICoreWebView2_2>().ok())
+      .and_then(|webview2| webview2.Environment().ok())
+      .and_then(|env| env.cast::<ICoreWebView2Environment3>().ok());
 
-  let default_cursor = LoadCursorW(None, IDC_ARROW).unwrap_or_default();
+    let default_cursor = LoadCursorW(None, IDC_ARROW).unwrap_or_default();
 
-  let host = Box::new(CompositionHost {
-    controller: controller.clone(),
-    comp_controller: comp_controller.clone(),
-    env3,
-    cursor: Cell::new(default_cursor),
-    mouse_tracking: Cell::new(false),
-    cursor_changed_token: 0,
-  });
-  let host_ptr = Box::into_raw(host);
+    let host = Box::new(CompositionHost {
+      controller: controller.clone(),
+      comp_controller: comp_controller.clone(),
+      env3,
+      cursor: Cell::new(default_cursor),
+      mouse_tracking: Cell::new(false),
+      cursor_changed_token: 0,
+    });
+    let host_ptr = Box::into_raw(host);
 
-  // The webview pushes cursor changes (I-beam over text, pointer over links…);
-  // remember the cursor for WM_SETCURSOR and apply it immediately, since the
-  // mouse is over the webview when the change fires.
-  let mut token = 0i64;
-  let register = comp_controller.add_CursorChanged(
-    &CursorChangedEventHandler::create(Box::new(move |sender, _args| {
-      if let Some(sender) = sender {
-        if let Some(cursor) = resolve_cursor(&sender) {
-          // SAFETY: the host box outlives the registration — the destroy path
-          // removes this handler before freeing the box, on the same thread.
-          unsafe { (*host_ptr).cursor.set(cursor) };
-          let _ = unsafe { SetCursor(Some(cursor)) };
-        }
-      }
-      Ok(())
-    })),
-    &mut token,
-  );
-  if let Err(e) = register {
-    drop(Box::from_raw(host_ptr));
-    return Err(windows::core::Error::from(e).into());
+    // The webview pushes cursor changes (I-beam over text, pointer over links…);
+    // remember the cursor for WM_SETCURSOR and apply it immediately, since the
+    // mouse is over the webview when the change fires.
+    let mut token = 0i64;
+    let register = comp_controller.add_CursorChanged(
+      &CursorChangedEventHandler::create(Box::new(move |sender, _args| {
+        // Called from a COM event; a panic must not unwind into WebView2.
+        catch_unwind(AssertUnwindSafe(|| {
+          if let Some(sender) = sender {
+            if let Some(cursor) = resolve_cursor(&sender) {
+              // SAFETY: the host box outlives the registration — the destroy
+              // path removes this handler before freeing the box, on the same
+              // thread.
+              (*host_ptr).cursor.set(cursor);
+              let _ = SetCursor(Some(cursor));
+            }
+          }
+        }))
+        .map_err(|_| windows::core::Error::from(E_FAIL))
+      })),
+      &mut token,
+    );
+    if let Err(e) = register {
+      drop(Box::from_raw(host_ptr));
+      return Err(e.into());
+    }
+    (*host_ptr).cursor_changed_token = token;
+
+    let result = SetWindowSubclass(
+      parent,
+      Some(host_subclass_proc),
+      COMPOSITION_SUBCLASS_ID as usize,
+      host_ptr as usize,
+    );
+    if !result.as_bool() {
+      let _ = comp_controller.remove_CursorChanged(token);
+      drop(Box::from_raw(host_ptr));
+      return Err(Error::WebView2Error(webview2_com::Error::WindowsError(
+        windows::core::Error::from(E_UNEXPECTED),
+      )));
+    }
+
+    Ok(())
   }
-  (*host_ptr).cursor_changed_token = token;
-
-  let result = SetWindowSubclass(
-    parent,
-    Some(host_subclass_proc),
-    COMPOSITION_SUBCLASS_ID as usize,
-    host_ptr as usize,
-  );
-  if !result.as_bool() {
-    let _ = comp_controller.remove_CursorChanged(token);
-    drop(Box::from_raw(host_ptr));
-    return Err(Error::WebView2Error(webview2_com::Error::WindowsError(
-      windows::core::Error::from(E_UNEXPECTED),
-    )));
-  }
-
-  Ok(())
 }
 
 /// The cursor to apply for the webview's current state.
@@ -298,13 +339,15 @@ fn resolve_cursor(sender: &ICoreWebView2CompositionController) -> Option<HCURSOR
 }
 
 /// The counterpart of `InnerWebView::dettach_parent_subclass`.
-pub unsafe fn detach_host_subclass(parent: HWND) {
-  SendMessageW(parent, COMPOSITION_DESTROY_MESSAGE, None, None);
-  let _ = RemoveWindowSubclass(
-    parent,
-    Some(host_subclass_proc),
-    COMPOSITION_SUBCLASS_ID as usize,
-  );
+pub(crate) unsafe fn detach_host_subclass(parent: HWND) {
+  unsafe {
+    SendMessageW(parent, COMPOSITION_DESTROY_MESSAGE, None, None);
+    let _ = RemoveWindowSubclass(
+      parent,
+      Some(host_subclass_proc),
+      COMPOSITION_SUBCLASS_ID as usize,
+    );
+  }
 }
 
 unsafe extern "system" fn host_subclass_proc(
@@ -315,15 +358,43 @@ unsafe extern "system" fn host_subclass_proc(
   _uidsubclass: usize,
   dwrefdata: usize,
 ) -> LRESULT {
-  let host_ptr = dwrefdata as *mut CompositionHost;
-  if host_ptr.is_null() {
-    return DefSubclassProc(hwnd, msg, wparam, lparam);
-  }
-  let host = &*host_ptr;
+  // A panic must not unwind into the window manager; fall back to the next
+  // window procedure instead.
+  catch_unwind(AssertUnwindSafe(|| unsafe {
+    handle_host_message(hwnd, msg, wparam, lparam, dwrefdata as *mut CompositionHost)
+  }))
+  .unwrap_or_else(|_| unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) })
+}
 
-  match msg {
-    WM_SIZE => {
-      if wparam.0 != SIZE_MINIMIZED as usize {
+/// `host_ptr` is the `CompositionHost` boxed by [`attach_host_subclass`]; it
+/// stays valid until this function frees it on the destroy messages.
+unsafe fn handle_host_message(
+  hwnd: HWND,
+  msg: u32,
+  wparam: WPARAM,
+  lparam: LPARAM,
+  host_ptr: *mut CompositionHost,
+) -> LRESULT {
+  unsafe {
+    if msg == WM_DESTROY || msg == COMPOSITION_DESTROY_MESSAGE {
+      // Unsubclass before freeing the host state, so nothing re-entered while
+      // the controller tears down can reach it.
+      let _ = RemoveWindowSubclass(
+        hwnd,
+        Some(host_subclass_proc),
+        COMPOSITION_SUBCLASS_ID as usize,
+      );
+      let host = Box::from_raw(host_ptr);
+      let _ = host
+        .comp_controller
+        .remove_CursorChanged(host.cursor_changed_token);
+      drop(host);
+      return DefSubclassProc(hwnd, msg, wparam, lparam);
+    }
+
+    let host = &*host_ptr;
+    match msg {
+      WM_SIZE if wparam.0 != SIZE_MINIMIZED as usize => {
         let mut client_rect = RECT::default();
         if GetClientRect(hwnd, &mut client_rect).is_ok() {
           let _ = host.controller.SetBounds(RECT {
@@ -334,66 +405,45 @@ unsafe extern "system" fn host_subclass_proc(
           });
         }
       }
-    }
 
-    WM_SETFOCUS | WM_ENTERSIZEMOVE => {
-      let _ = host
-        .controller
-        .MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
-    }
+      WM_SETFOCUS => {
+        let _ = host
+          .controller
+          .MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
+      }
 
-    msg if msg == WM_MOVE || msg == WM_MOVING => {
-      let _ = host.controller.NotifyParentWindowPositionChanged();
-    }
+      WM_MOVE | WM_MOVING => {
+        let _ = host.controller.NotifyParentWindowPositionChanged();
+      }
 
-    WM_SETCURSOR => {
       // Only own the cursor inside the client area (which the webview covers
       // in composition mode); non-client hits keep the host's resize arrows.
-      if (lparam.0 & 0xFFFF) as u32 == HTCLIENT {
+      WM_SETCURSOR if (lparam.0 & 0xFFFF) as u32 == HTCLIENT => {
         let _ = SetCursor(Some(host.cursor.get()));
         return LRESULT(1);
       }
-    }
 
-    WM_MOUSEMOVE | WM_MOUSELEAVE | WM_MOUSEWHEEL | WM_MOUSEHWHEEL | WM_LBUTTONDOWN
-    | WM_LBUTTONUP | WM_LBUTTONDBLCLK | WM_RBUTTONDOWN | WM_RBUTTONUP | WM_RBUTTONDBLCLK
-    | WM_MBUTTONDOWN | WM_MBUTTONUP | WM_MBUTTONDBLCLK | WM_XBUTTONDOWN | WM_XBUTTONUP
-    | WM_XBUTTONDBLCLK => {
-      forward_mouse_message(host, hwnd, msg, wparam, lparam);
-      // Deliberately fall through to DefSubclassProc: the host's own window
-      // proc still sees the message, so host-side window machinery (its event
-      // stream, drag/resize bookkeeping) keeps working. The webview and the
-      // host both observing input is by design in this hosting model — the
-      // host owns the input queue.
-    }
-
-    WM_POINTERDOWN | WM_POINTERUPDATE | WM_POINTERUP => {
-      forward_pointer_message(host, hwnd, msg, wparam);
-    }
-
-    msg if msg == WM_DESTROY || msg == COMPOSITION_DESTROY_MESSAGE => {
-      if !(dwrefdata as *mut ()).is_null() {
-        let host = Box::from_raw(host_ptr);
-        let _ = host
-          .comp_controller
-          .remove_CursorChanged(host.cursor_changed_token);
-        drop(host);
-
-        // Null out `dwrefdata` so a second destroy cannot double-free (same
-        // guard as the windowed parent subclass).
-        let _ = SetWindowSubclass(
-          hwnd,
-          Some(host_subclass_proc),
-          COMPOSITION_SUBCLASS_ID as usize,
-          std::ptr::null::<()>() as usize,
-        );
+      WM_MOUSEMOVE | WM_MOUSELEAVE | WM_MOUSEWHEEL | WM_MOUSEHWHEEL | WM_LBUTTONDOWN
+      | WM_LBUTTONUP | WM_LBUTTONDBLCLK | WM_RBUTTONDOWN | WM_RBUTTONUP | WM_RBUTTONDBLCLK
+      | WM_MBUTTONDOWN | WM_MBUTTONUP | WM_MBUTTONDBLCLK | WM_XBUTTONDOWN | WM_XBUTTONUP
+      | WM_XBUTTONDBLCLK => {
+        forward_mouse_message(host, hwnd, msg, wparam, lparam);
+        // Deliberately fall through to DefSubclassProc: the host's own window
+        // proc still sees the message, so host-side window machinery (its event
+        // stream, drag/resize bookkeeping) keeps working. The webview and the
+        // host both observing input is by design in this hosting model — the
+        // host owns the input queue.
       }
+
+      WM_POINTERDOWN | WM_POINTERUPDATE | WM_POINTERUP => {
+        forward_pointer_message(host, hwnd, msg, wparam);
+      }
+
+      _ => (),
     }
 
-    _ => (),
+    DefSubclassProc(hwnd, msg, wparam, lparam)
   }
-
-  DefSubclassProc(hwnd, msg, wparam, lparam)
 }
 
 #[inline]
@@ -421,7 +471,7 @@ fn forward_mouse_message(
   wparam: WPARAM,
   lparam: LPARAM,
 ) {
-  let mut point = windows::Win32::Foundation::POINT {
+  let mut point = POINT {
     x: get_x_lparam(lparam),
     y: get_y_lparam(lparam),
   };
@@ -444,20 +494,18 @@ fn forward_mouse_message(
     }
     WM_MOUSELEAVE => {
       host.mouse_tracking.set(false);
-      point = windows::Win32::Foundation::POINT { x: 0, y: 0 };
+      point = POINT { x: 0, y: 0 };
       virtual_keys = 0;
     }
-    WM_MOUSEMOVE => {
-      if !host.mouse_tracking.get() {
-        let mut tme = TRACKMOUSEEVENT {
-          cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
-          dwFlags: TME_LEAVE,
-          hwndTrack: hwnd,
-          dwHoverTime: 0,
-        };
-        if unsafe { TrackMouseEvent(&mut tme) }.is_ok() {
-          host.mouse_tracking.set(true);
-        }
+    WM_MOUSEMOVE if !host.mouse_tracking.get() => {
+      let mut tme = TRACKMOUSEEVENT {
+        cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+        dwFlags: TME_LEAVE,
+        hwndTrack: hwnd,
+        dwHoverTime: 0,
+      };
+      if unsafe { TrackMouseEvent(&mut tme) }.is_ok() {
+        host.mouse_tracking.set(true);
       }
     }
     _ => {}
@@ -510,11 +558,10 @@ fn forward_pointer_message(host: &CompositionHost, hwnd: HWND, msg: u32, wparam:
   }
 
   let filled: Result<ICoreWebView2PointerInfo> = (|| {
-    let info =
-      unsafe { env3.CreateCoreWebView2PointerInfo() }.map_err(windows::core::Error::from)?;
+    let info = unsafe { env3.CreateCoreWebView2PointerInfo() }?;
 
     if pointer_type == PT_TOUCH {
-      let mut touch = windows::Win32::UI::Input::Pointer::POINTER_TOUCH_INFO::default();
+      let mut touch = POINTER_TOUCH_INFO::default();
       unsafe { GetPointerTouchInfo(pointer_id, &mut touch)? };
       unsafe {
         fill_common_pointer_info(&info, hwnd, &touch.pointerInfo)?;
@@ -527,7 +574,7 @@ fn forward_pointer_message(host: &CompositionHost, hwnd: HWND, msg: u32, wparam:
         info.SetTouchContact(contact)?;
       }
     } else {
-      let mut pen = windows::Win32::UI::Input::Pointer::POINTER_PEN_INFO::default();
+      let mut pen = POINTER_PEN_INFO::default();
       unsafe { GetPointerPenInfo(pointer_id, &mut pen)? };
       unsafe {
         fill_common_pointer_info(&info, hwnd, &pen.pointerInfo)?;
@@ -559,34 +606,36 @@ unsafe fn fill_common_pointer_info(
   hwnd: HWND,
   src: &POINTER_INFO,
 ) -> Result<()> {
-  info.SetPointerKind(src.pointerType.0 as u32)?;
-  info.SetPointerId(src.pointerId)?;
-  info.SetFrameId(src.frameId)?;
-  info.SetPointerFlags(src.pointerFlags.0 as u32)?;
-  info.SetTime(src.dwTime)?;
-  info.SetHistoryCount(src.historyCount)?;
-  info.SetInputData(src.InputData)?;
-  info.SetKeyStates(src.dwKeyStates)?;
-  info.SetPerformanceCount(src.PerformanceCount)?;
-  info.SetButtonChangeKind(src.ButtonChangeType.0)?;
+  unsafe {
+    info.SetPointerKind(src.pointerType.0 as u32)?;
+    info.SetPointerId(src.pointerId)?;
+    info.SetFrameId(src.frameId)?;
+    info.SetPointerFlags(src.pointerFlags.0)?;
+    info.SetTime(src.dwTime)?;
+    info.SetHistoryCount(src.historyCount)?;
+    info.SetInputData(src.InputData)?;
+    info.SetKeyStates(src.dwKeyStates)?;
+    info.SetPerformanceCount(src.PerformanceCount)?;
+    info.SetButtonChangeKind(src.ButtonChangeType.0)?;
 
-  let mut pixel = src.ptPixelLocation;
-  let _ = ScreenToClient(hwnd, &mut pixel);
-  info.SetPixelLocation(pixel)?;
-  let mut pixel_raw = src.ptPixelLocationRaw;
-  let _ = ScreenToClient(hwnd, &mut pixel_raw);
-  info.SetPixelLocationRaw(pixel_raw)?;
+    let mut pixel = src.ptPixelLocation;
+    let _ = ScreenToClient(hwnd, &mut pixel);
+    info.SetPixelLocation(pixel)?;
+    let mut pixel_raw = src.ptPixelLocationRaw;
+    let _ = ScreenToClient(hwnd, &mut pixel_raw);
+    info.SetPixelLocationRaw(pixel_raw)?;
+  }
 
   Ok(())
 }
 
 /// Translates a screen-space RECT into client space in place.
 fn client_rect_from_screen(hwnd: HWND, rect: &mut RECT) {
-  let mut top_left = windows::Win32::Foundation::POINT {
+  let mut top_left = POINT {
     x: rect.left,
     y: rect.top,
   };
-  let mut bottom_right = windows::Win32::Foundation::POINT {
+  let mut bottom_right = POINT {
     x: rect.right,
     y: rect.bottom,
   };

@@ -391,9 +391,9 @@ pub use wkwebview::{PrintMargin, PrintOptions, WryWebView};
 #[cfg(target_os = "windows")]
 pub(crate) mod webview2;
 #[cfg(target_os = "windows")]
-pub use self::webview2::register_composition_visual_target;
-#[cfg(target_os = "windows")]
 pub use self::webview2::ScrollBarStyle;
+#[cfg(target_os = "windows")]
+pub use self::webview2::register_composition_visual_target;
 #[cfg(target_os = "windows")]
 use self::webview2::*;
 #[cfg(target_os = "windows")]
@@ -1898,6 +1898,13 @@ pub trait WebViewBuilderExtWindows {
   /// controller visibility, and [`WebView::reparent`] returns an error. The
   /// visual's position and size in the host window are controlled entirely by
   /// the caller's DirectComposition tree.
+  ///
+  /// WebView2 connects its visual tree to `visual` while the webview is built;
+  /// commit the DirectComposition device that owns `visual` afterwards, or
+  /// nothing shows up. The host window stays the caller's: dropping the
+  /// webview (or `window.close()` in the page) never destroys it, and a new
+  /// webview can be built on it afterwards. A window hosts at most one
+  /// composition webview at a time; building a second one fails.
   ///
   /// Combine with [`WebViewBuilder::with_transparent`] for a webview that
   /// composites over content drawn on sibling visuals below it.

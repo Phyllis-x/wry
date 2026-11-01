@@ -84,7 +84,8 @@ pub(crate) struct InnerWebView {
 impl Drop for InnerWebView {
   fn drop(&mut self) {
     let _ = unsafe { self.controller.Close() };
-    if self.is_child {
+    // A composition webview has no container: `hwnd` is the caller's host window.
+    if self.is_child && !self.is_composition {
       let _ = unsafe { DestroyWindow(self.hwnd) };
     }
     if self.is_composition {
@@ -144,6 +145,9 @@ impl InnerWebView {
       .clone()
       .or_else(|| composition::take_registered_visual_target(parent.0 as isize));
     let is_composition = composition_visual.is_some();
+    if is_composition {
+      composition::ensure_host_available(parent)?;
+    }
 
     let hwnd = if is_composition {
       parent
@@ -527,7 +531,16 @@ impl InnerWebView {
     unsafe { Self::set_webview_settings(&webview, &attributes, &pl_attrs)? };
 
     // Webview handlers
-    unsafe { Self::attach_handlers(hwnd, &webview, &mut attributes, &mut token, env)? };
+    unsafe {
+      Self::attach_handlers(
+        hwnd,
+        &webview,
+        &mut attributes,
+        &mut token,
+        env,
+        is_composition,
+      )?
+    };
 
     // IPC handler
     if let Some(ipc_handler) = attributes.ipc_handler.take() {
@@ -736,13 +749,17 @@ impl InnerWebView {
     attributes: &mut WebViewAttributes,
     token: &mut EventRegistrationToken,
     env: &ICoreWebView2Environment,
+    is_composition: bool,
   ) -> Result<()> {
     unsafe {
-      // Close container HWND when `window.close` is called in JS
-      webview.add_WindowCloseRequested(
-        &WindowCloseRequestedEventHandler::create(Box::new(move |_, _| DestroyWindow(hwnd))),
-        token,
-      )?;
+      // Close container HWND when `window.close` is called in JS. A composition
+      // webview has no container: `hwnd` is the caller's host window.
+      if !is_composition {
+        webview.add_WindowCloseRequested(
+          &WindowCloseRequestedEventHandler::create(Box::new(move |_, _| DestroyWindow(hwnd))),
+          token,
+        )?;
+      }
 
       // Document title changed handler
       if let Some(document_title_changed_handler) = attributes.document_title_changed_handler.take()
@@ -1637,7 +1654,8 @@ impl InnerWebView {
   pub fn bounds(&self) -> Result<Rect> {
     let mut bounds = Rect::default();
     let mut rect = RECT::default();
-    if self.is_child {
+    // A composition webview has no container window; its bounds live on the controller.
+    if self.is_child && !self.is_composition {
       unsafe { GetClientRect(self.hwnd, &mut rect)? };
 
       let position_point = &mut [POINT {
